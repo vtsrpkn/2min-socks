@@ -1,4 +1,13 @@
-###Here’s a paste-and-run installer that sets up Dante SOCKS5 with username/password, opens the firewall (optionally locked to your IP), and starts the service on boot.
+# 🧦 Simple Dante SOCKS5 Proxy Installer
+
+A **paste-and-run** Bash installer that sets up a **Dante SOCKS5 proxy** with username/password authentication.  
+It automatically opens the firewall (optionally locks access to a specific IP), enables the service on boot, and works out of the box on **Ubuntu 22.04 / 24.04**.
+
+---
+
+## 🚀 Quick Install
+
+Copy and paste this command into your **Ubuntu VPS**:
 
 ```bash
 cat <<'EOF' > ~/install-dante.sh
@@ -140,3 +149,51 @@ EOF
 
 sudo bash ~/install-dante.sh
 ```
+
+---
+
+## 🧩 Features
+
+- 🔒 Username/password authentication (no open proxy risk)  
+- 🔥 UFW firewall configuration (auto-open or restrict by IP)  
+- 🔁 Autostart on boot (`systemd`)  
+- 🧠 Automatic network interface detection  
+- 💨 Works out of the box with browsers, `curl`, or any SOCKS5-compatible client  
+
+---
+
+## 🧪 Example Test Command
+
+```bash
+curl -x socks5h://proxyuser:yourpassword@<SERVER_IP>:1080 https://ipinfo.io
+```
+
+---
+
+## 🛠 Managing the Service
+
+| Command | Description |
+|----------|-------------|
+| `sudo systemctl restart danted` | Restart the proxy |
+| `sudo systemctl status danted` | Check proxy status |
+| `sudo systemctl disable danted` | Disable on boot |
+| `sudo systemctl enable danted` | Enable on boot |
+
+---
+
+## ⚠️ Security Notes
+
+- Do **not** expose port 1080 publicly without authentication.  
+- Use strong passwords and restrict access by IP if possible.  
+- Regularly update your packages:
+  ```bash
+  sudo apt update && sudo apt upgrade -y
+  ```
+- For extra stealth, run on a non-standard port (e.g. 51820).
+
+---
+
+## 🧾 License
+
+**MIT License © 2025**  
+Feel free to fork, modify, and share.
