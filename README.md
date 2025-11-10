@@ -1,0 +1,142 @@
+###Here’s a paste-and-run installer that sets up Dante SOCKS5 with username/password, opens the firewall (optionally locked to your IP), and starts the service on boot.
+
+```bash
+cat <<'EOF' > ~/install-dante.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== Dante SOCKS5 installer (Ubuntu 22.04/24.04) ==="
+
+# --- Prompt for basics (with sensible defaults) ---
+read -rp "Proxy username [proxyuser]: " PROXY_USER
+PROXY_USER=${PROXY_USER:-proxyuser}
+
+# Ask for password silently
+while true; do
+  read -rsp "Proxy password: " PROXY_PASS; echo
+  read -rsp "Confirm password: " PROXY_PASS2; echo
+  [[ "$PROXY_PASS" == "$PROXY_PASS2" && -n "$PROXY_PASS" ]] && break
+  echo "Passwords did not match or were empty. Try again."
+done
+
+read -rp "SOCKS port [1080]: " PROXY_PORT
+PROXY_PORT=${PROXY_PORT:-1080}
+
+read -rp "Restrict access to a single client IP (optional, e.g. 1.2.3.4). Leave empty for open-to-Internet (with auth): " ALLOW_IP
+ALLOW_IP=${ALLOW_IP:-}
+
+# --- Detect primary network interface ---
+IFACE="$(ip -4 route ls default 2>/dev/null | awk '{print $5; exit}')"
+if [[ -z "${IFACE:-}" ]]; then
+  echo "Could not detect default network interface automatically."
+  read -rp "Enter your public interface name (e.g. eth0, ens3): " IFACE
+fi
+echo "Using network interface: ${IFACE}"
+
+# --- Install Dante server ---
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y dante-server
+
+# --- Create/ensure auth user exists and set password ---
+if id -u "$PROXY_USER" >/dev/null 2>&1; then
+  echo "User '$PROXY_USER' already exists; updating password…"
+else
+  adduser --disabled-password --gecos "" "$PROXY_USER"
+fi
+echo "${PROXY_USER}:${PROXY_PASS}" | chpasswd
+
+# --- Write Dante config ---
+cat >/etc/danted.conf <<CFG
+# ===== /etc/danted.conf (managed by installer) =====
+logoutput: syslog
+
+internal: ${IFACE} port = ${PROXY_PORT}
+external: ${IFACE}
+
+# Only username/password authentication
+method: username
+
+# Drop privileges
+user.notprivileged: nobody
+
+# Allow authenticated clients to connect to anywhere
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect disconnect error
+}
+pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: bind connect udpassociate
+    log: connect disconnect error
+}
+
+# Deny everything else
+block {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+}
+# ===== end =====
+CFG
+
+# --- UFW firewall rules ---
+need_enable_ufw=false
+if ! command -v ufw >/dev/null 2>&1; then
+  apt-get install -y ufw
+fi
+
+ufw status | grep -qi inactive && need_enable_ufw=true
+
+if [[ -n "$ALLOW_IP" ]]; then
+  ufw allow from "$ALLOW_IP" to any port "${PROXY_PORT}" proto tcp
+  echo "UFW: allowing TCP ${PROXY_PORT} from ${ALLOW_IP}"
+else
+  ufw allow "${PROXY_PORT}"/tcp
+  echo "UFW: allowing TCP ${PROXY_PORT} from anywhere (authentication still required)"
+fi
+
+# Keep SSH open
+SSH_PORT=$(ss -tlpn | awk '/sshd/ {print $4}' | sed 's/.*://;q')
+SSH_PORT=${SSH_PORT:-22}
+ufw allow "${SSH_PORT}"/tcp >/dev/null 2>&1 || true
+
+if $need_enable_ufw; then
+  echo "y" | ufw enable
+else
+  ufw reload
+fi
+
+# --- Enable and start Dante ---
+systemctl daemon-reload
+systemctl enable danted
+systemctl restart danted
+
+sleep 1
+systemctl --no-pager --full status danted || true
+
+# --- Show connection info ---
+SERVER_IP="$(curl -s https://ifconfig.me || true)"
+if [[ -z "$SERVER_IP" ]]; then
+  SERVER_IP="$(hostname -I | awk '{print $1}')"
+fi
+
+echo
+echo "=== Done! Your SOCKS5 proxy is ready. ==="
+echo "Server IP: ${SERVER_IP}"
+echo "Port:      ${PROXY_PORT}"
+if [[ -n "$ALLOW_IP" ]]; then
+  echo "Allowed client IP: ${ALLOW_IP}"
+else
+  echo "Allowed clients:    any (authenticated)"
+fi
+echo "Auth:      username='${PROXY_USER}'  password='(hidden)'"
+echo
+echo "Test from a client:"
+echo "  curl -x socks5h://${PROXY_USER}:<password>@${SERVER_IP}:${PROXY_PORT} https://ipinfo.io/ip"
+echo
+echo "To change settings later:"
+echo "  sudo nano /etc/danted.conf   # then: sudo systemctl restart danted"
+EOF
+
+sudo bash ~/install-dante.sh
+```
