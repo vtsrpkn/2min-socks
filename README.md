@@ -1,7 +1,7 @@
 # 🧦 Simple Dante SOCKS5 Proxy Installer
 
 A **paste-and-run** Bash installer that sets up a **Dante SOCKS5 proxy** with username/password authentication.  
-It automatically opens the firewall (optionally locks access to a specific IP), enables the service on boot, and works out of the box on **Ubuntu 22.04 / 24.04**.
+It automatically opens the firewall, enables the service on boot, and works out of the box on **Ubuntu 22.04 / 24.04**.
 
 ---
 
@@ -14,137 +14,148 @@ cat <<'EOF' > ~/install-dante.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Dante SOCKS5 installer (Ubuntu 22.04/24.04) ==="
+echo "=== Dante SOCKS5 installer for Ubuntu 22.04/24.04 IPv4 ==="
 
-# --- Prompt for basics (with sensible defaults) ---
+if [[ $EUID -ne 0 ]]; then
+  echo "Run with sudo:"
+  echo "sudo bash ~/install-dante.sh"
+  exit 1
+fi
+
 read -rp "Proxy username [proxyuser]: " PROXY_USER
 PROXY_USER=${PROXY_USER:-proxyuser}
 
-# Ask for password silently
 while true; do
   read -rsp "Proxy password: " PROXY_PASS; echo
   read -rsp "Confirm password: " PROXY_PASS2; echo
-  [[ "$PROXY_PASS" == "$PROXY_PASS2" && -n "$PROXY_PASS" ]] && break
+
+  if [[ -n "$PROXY_PASS" && "$PROXY_PASS" == "$PROXY_PASS2" ]]; then
+    break
+  fi
+
   echo "Passwords did not match or were empty. Try again."
 done
 
 read -rp "SOCKS port [1080]: " PROXY_PORT
 PROXY_PORT=${PROXY_PORT:-1080}
 
-read -rp "Restrict access to a single client IP (optional, e.g. 1.2.3.4). Leave empty for open-to-Internet (with auth): " ALLOW_IP
-ALLOW_IP=${ALLOW_IP:-}
+if ! [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] || (( PROXY_PORT < 1 || PROXY_PORT > 65535 )); then
+  echo "Invalid port: $PROXY_PORT"
+  exit 1
+fi
 
-# --- Detect primary network interface ---
 IFACE="$(ip -4 route ls default 2>/dev/null | awk '{print $5; exit}')"
+
 if [[ -z "${IFACE:-}" ]]; then
-  echo "Could not detect default network interface automatically."
-  read -rp "Enter your public interface name (e.g. eth0, ens3): " IFACE
+  echo "Could not detect IPv4 default network interface."
+  echo "Your server may not have IPv4 configured."
+  exit 1
 fi
-echo "Using network interface: ${IFACE}"
 
-# --- Install Dante server ---
+SERVER_IPV4="$(curl -4 -fsS --max-time 5 https://ifconfig.me 2>/dev/null || true)"
+
+if [[ -z "$SERVER_IPV4" ]]; then
+  echo "Could not detect public IPv4."
+  echo "Check if your server has IPv4:"
+  echo "ip -4 addr"
+  exit 1
+fi
+
+echo "Using IPv4 interface: $IFACE"
+echo "Detected public IPv4: $SERVER_IPV4"
+
 export DEBIAN_FRONTEND=noninteractive
+
 apt-get update -y
-apt-get install -y dante-server
+apt-get install -y dante-server ufw curl ca-certificates
 
-# --- Create/ensure auth user exists and set password ---
 if id -u "$PROXY_USER" >/dev/null 2>&1; then
-  echo "User '$PROXY_USER' already exists; updating password…"
+  echo "User '$PROXY_USER' already exists; updating password."
 else
-  adduser --disabled-password --gecos "" "$PROXY_USER"
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$PROXY_USER"
 fi
-echo "${PROXY_USER}:${PROXY_PASS}" | chpasswd
 
-# --- Write Dante config ---
+echo "${PROXY_USER}:${PROXY_PASS}" | chpasswd
+unset PROXY_PASS PROXY_PASS2
+
+if ! id -u dantedrun >/dev/null 2>&1; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin dantedrun
+fi
+
+if [[ -f /etc/danted.conf ]]; then
+  cp -a /etc/danted.conf "/etc/danted.conf.bak.$(date +%Y%m%d%H%M%S)"
+fi
+
 cat >/etc/danted.conf <<CFG
-# ===== /etc/danted.conf (managed by installer) =====
 logoutput: syslog
 
-internal: ${IFACE} port = ${PROXY_PORT}
+internal: 0.0.0.0 port = ${PROXY_PORT}
 external: ${IFACE}
 
-# Only username/password authentication
-method: username
+socksmethod: username
 
-# Drop privileges
-user.notprivileged: nobody
+user.privileged: root
+user.unprivileged: dantedrun
+user.libwrap: dantedrun
 
-# Allow authenticated clients to connect to anywhere
 client pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
     log: connect disconnect error
 }
-pass {
+
+client block {
     from: 0.0.0.0/0 to: 0.0.0.0/0
-    protocol: tcp udp
-    command: bind connect udpassociate
+    log: connect error
+}
+
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    command: connect
+    protocol: tcp
+    proxyprotocol: socks_v5
+    socksmethod: username
+    user: ${PROXY_USER}
     log: connect disconnect error
 }
 
-# Deny everything else
-block {
+socks block {
     from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect error
 }
-# ===== end =====
 CFG
 
-# --- UFW firewall rules ---
-need_enable_ufw=false
-if ! command -v ufw >/dev/null 2>&1; then
-  apt-get install -y ufw
-fi
+danted -V -f /etc/danted.conf
 
-ufw status | grep -qi inactive && need_enable_ufw=true
+ufw allow OpenSSH >/dev/null 2>&1 || true
+ufw allow "${PROXY_PORT}/tcp" comment "Dante SOCKS5" >/dev/null
 
-if [[ -n "$ALLOW_IP" ]]; then
-  ufw allow from "$ALLOW_IP" to any port "${PROXY_PORT}" proto tcp
-  echo "UFW: allowing TCP ${PROXY_PORT} from ${ALLOW_IP}"
-else
-  ufw allow "${PROXY_PORT}"/tcp
-  echo "UFW: allowing TCP ${PROXY_PORT} from anywhere (authentication still required)"
-fi
-
-# Keep SSH open
-SSH_PORT=$(ss -tlpn | awk '/sshd/ {print $4}' | sed 's/.*://;q')
-SSH_PORT=${SSH_PORT:-22}
-ufw allow "${SSH_PORT}"/tcp >/dev/null 2>&1 || true
-
-if $need_enable_ufw; then
-  echo "y" | ufw enable
+if ufw status | grep -qi inactive; then
+  ufw --force enable
 else
   ufw reload
 fi
 
-# --- Enable and start Dante ---
 systemctl daemon-reload
-systemctl enable danted
+systemctl enable danted >/dev/null
 systemctl restart danted
 
 sleep 1
-systemctl --no-pager --full status danted || true
 
-# --- Show connection info ---
-SERVER_IP="$(curl -s https://ifconfig.me || true)"
-if [[ -z "$SERVER_IP" ]]; then
-  SERVER_IP="$(hostname -I | awk '{print $1}')"
+if ! systemctl is-active --quiet danted; then
+  echo "Dante failed to start."
+  systemctl status danted --no-pager --full
+  exit 1
 fi
 
 echo
-echo "=== Done! Your SOCKS5 proxy is ready. ==="
-echo "Server IP: ${SERVER_IP}"
-echo "Port:      ${PROXY_PORT}"
-if [[ -n "$ALLOW_IP" ]]; then
-  echo "Allowed client IP: ${ALLOW_IP}"
-else
-  echo "Allowed clients:    any (authenticated)"
-fi
-echo "Auth:      username='${PROXY_USER}'  password='(hidden)'"
+echo "=== Done. SOCKS5 proxy is ready on IPv4. ==="
+echo "SOCKS5 host: $SERVER_IPV4"
+echo "SOCKS5 port: $PROXY_PORT"
+echo "Username:    $PROXY_USER"
+echo "Password:    the password you entered"
 echo
-echo "Test from a client:"
-echo "  curl -x socks5h://${PROXY_USER}:<password>@${SERVER_IP}:${PROXY_PORT} https://ipinfo.io/ip"
-echo
-echo "To change settings later:"
-echo "  sudo nano /etc/danted.conf   # then: sudo systemctl restart danted"
+echo "Test from your computer:"
+echo "curl -x socks5h://${PROXY_USER}:YOUR_PASSWORD@${SERVER_IPV4}:${PROXY_PORT} https://ipinfo.io/ip"
 EOF
 
 sudo bash ~/install-dante.sh
@@ -155,7 +166,7 @@ sudo bash ~/install-dante.sh
 ## 🧩 Features
 
 - 🔒 Username/password authentication (no open proxy risk)  
-- 🔥 UFW firewall configuration (auto-open or restrict by IP)  
+- 🔥 UFW firewall configuration  
 - 🔁 Autostart on boot (`systemd`)  
 - 🧠 Automatic network interface detection  
 - 💨 Works out of the box with browsers, `curl`, or any SOCKS5-compatible client  
